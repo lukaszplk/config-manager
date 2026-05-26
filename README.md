@@ -26,13 +26,15 @@ pip install "config-manager[yaml]"
 
 ```
 project/
-├── config.json
+├── config/
+│   ├── config.json
+│   └── .env
 ├── preprocess.py
 └── pipeline/
-    └── train.py   ← ConfigManager() walks up and finds config.json
+    └── train.py   ← ConfigManager() walks up and finds config/config.json
 ```
 
-**config.json**
+**config/config.json**
 ```json
 {
     "_globals": {
@@ -159,13 +161,29 @@ KeyError: "Reference {{version}}: no section prefix given and 'version' not
 found in '_globals'. Use {{section.version}} or add it to '_globals'."
 ```
 
+## Config file location
+
+Config files must live inside a `config/` directory.  
+The `.env` file also goes in the same `config/` directory.
+
+```
+project/
+├── config/
+│   ├── config.json   ← or config.yaml / config.toml
+│   └── .env
+└── scripts/
+    └── train.py
+```
+
+`ConfigManager()` walks up from the calling script until it finds `config/config.json` (or yaml/toml).
+
 ## Config file formats
 
 | File | Notes |
 |------|-------|
-| `config.json` | No extra dependencies |
-| `config.yaml` / `config.yml` | Requires `pip install pyyaml` |
-| `config.toml` | Built-in on Python 3.11+; `pip install tomli` on older |
+| `config/config.json` | No extra dependencies |
+| `config/config.yaml` / `config.yml` | Requires `pip install pyyaml` |
+| `config/config.toml` | Built-in on Python 3.11+; `pip install tomli` on older |
 
 ## Reference syntax
 

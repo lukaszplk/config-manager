@@ -15,13 +15,14 @@ Features:
 Typical layout::
 
     project/
-    ├── .env
-    ├── config.json
+    ├── config/
+    │   ├── config.json
+    │   └── .env
     ├── script01.py
     └── pipeline/
-        └── script02.py   ← ConfigManager() walks up and finds config.json
+        └── script02.py   ← ConfigManager() walks up and finds config/config.json
 
-config.json example::
+config/config.json example::
 
     {
         "_globals": {"root": "data/", "version": "v2"},
@@ -48,17 +49,18 @@ from typing import Any, Optional
 # subsequent segments are nested keys within that section.
 _REF_PATTERN = re.compile(r"\{\{([\w]+(?:\.[\w]+)*)\}\}")
 
+_CONFIG_DIR = "config"
 _CONFIG_NAMES = ("config.json", "config.yaml", "config.yml", "config.toml")
 _ENV_NAME = ".env"
 _GLOBALS_KEY = "_globals"
 
 
 def _find_config(start: Path) -> Optional[Path]:
-    """Walk from *start* upward until a config file is found."""
+    """Walk from *start* upward until a ``config/<file>`` is found."""
     current = start.resolve()
     while True:
         for name in _CONFIG_NAMES:
-            candidate = current / name
+            candidate = current / _CONFIG_DIR / name
             if candidate.is_file():
                 return candidate
         parent = current.parent
