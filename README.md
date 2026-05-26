@@ -7,7 +7,9 @@ A lightweight, zero-dependency config loader for Python data-processing pipeline
 - Walks **parent directories** automatically to find `config.json`, `config.yaml`, or `config.toml`
 - Loads `.env` from the same directory into `os.environ` (without overwriting existing vars)
 - **Auto-detects** the calling script's name as the active section — no boilerplate
-- Resolves `{{section.key}}` cross-references between sections
+- Special **`_globals` section** — its values are merged into every section automatically
+- Resolves **`{{section.key.subkey}}`** cross-references at arbitrary depth
+- Clear error messages when a reference can't be resolved
 
 ## Install
 
@@ -33,13 +35,17 @@ project/
 **config.json**
 ```json
 {
+    "_globals": {
+        "root":    "data/",
+        "version": "v2"
+    },
     "preprocess": {
-        "output": "results/clean.csv"
+        "output": "{{root}}clean.csv"
     },
     "train": {
-        "input":  "{{preprocess.output}}",
-        "lr":     0.01,
-        "epochs": 50
+        "input":   "{{preprocess.output}}",
+        "lr":      0.01,
+        "run_id":  "{{version}}"
     }
 }
 ```
@@ -48,48 +54,109 @@ project/
 ```python
 from config_manager import ConfigManager
 
-cfg = ConfigManager()     # section="train" detected automatically
+cfg = ConfigManager()       # section="train" detected from filename
 
-print(cfg["input"])       # results/clean.csv  (resolved from preprocess)
-print(cfg["lr"])          # 0.01
-print(cfg.get("device", "cpu"))  # cpu (default)
+cfg["input"]                # → "data/clean.csv"  (resolved via preprocess)
+cfg["lr"]                   # → 0.01
+cfg["version"]              # → "v2"  (injected from _globals)
+cfg["run_id"]               # → "v2"
+cfg.get("device", "cpu")    # → "cpu"  (default)
 ```
 
 ## Use cases
 
 ### 1 — Multi-step pipeline
 
-Each script reads only its own section; `{{section.key}}` wires them together.
+Each script reads only its own section. `{{section.key}}` wires outputs to inputs.
 
 ```python
 # preprocess.py
 cfg = ConfigManager()
-df.to_csv(cfg["output"])
+df.to_csv(cfg["output"])   # saves to "data/clean.csv"
 
 # train.py
 cfg = ConfigManager()
-df = pd.read_csv(cfg["input"])   # resolves to preprocess.output automatically
+df = pd.read_csv(cfg["input"])   # reads "data/clean.csv" automatically
 ```
 
-### 2 — Override section explicitly
+### 2 — Shared constants with `_globals`
+
+Put anything shared (paths, versions, DB hosts) in `_globals` and access it directly in every section without any `{{...}}` syntax.
+
+```json
+{
+    "_globals": {
+        "db_host": "localhost",
+        "root":    "data/"
+    },
+    "etl":  { "source": "{{root}}raw.csv" },
+    "api":  { "host":   "{{db_host}}" }
+}
+```
 
 ```python
-cfg = ConfigManager(section="shared")
-db_url = cfg["db_url"]
+cfg = ConfigManager()
+cfg["db_host"]   # available in every section
 ```
 
-### 3 — Logger injection
+### 3 — Deep nested references
+
+Reference values at any depth using dot notation.
+
+```json
+{
+    "infra": {
+        "storage": { "bucket": "my-bucket", "prefix": "runs/" }
+    },
+    "train": {
+        "output": "{{infra.storage.bucket}}/{{infra.storage.prefix}}model.pt"
+    }
+}
+```
+
+```python
+cfg = ConfigManager()
+cfg["output"]   # → "my-bucket/runs/model.pt"
+```
+
+### 4 — Logger injection
+
+Pass your own logger to capture config loading events at `DEBUG` level.
 
 ```python
 import logging
+from config_manager import ConfigManager
+
+logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
+
 cfg = ConfigManager(logger=log)
+# DEBUG config_manager: Config file: /project/config.json
+# DEBUG config_manager: Active section: 'train' | globals: ['root', 'version'] | ...
 ```
 
-### 4 — Custom search root
+### 5 — Override section or root
 
 ```python
+# Load a specific section explicitly
+cfg = ConfigManager(section="shared")
+
+# Start searching from a different directory
 cfg = ConfigManager(start_dir="/path/to/project")
+```
+
+## Error messages
+
+When a reference can't be resolved, you get a clear, actionable message:
+
+```
+KeyError: "Reference {{preprocess.no_such_key}}: Key 'no_such_key' not found
+under 'preprocess'. Available: ['output', 'batch_size']"
+```
+
+```
+KeyError: "Reference {{version}}: no section prefix given and 'version' not
+found in '_globals'. Use {{section.version}} or add it to '_globals'."
 ```
 
 ## Config file formats
@@ -102,16 +169,21 @@ cfg = ConfigManager(start_dir="/path/to/project")
 
 ## Reference syntax
 
-Use `{{section.key}}` anywhere in a string value to reference another section's key:
+Use `{{section.key}}` or `{{section.key.subkey.deeper}}` in any string value:
 
 ```json
 {
-    "shared": {"root": "data/"},
-    "train":  {"input": "{{shared.root}}train.csv"}
+    "_globals": {"root": "data/"},
+    "shared":   {"db": {"host": "localhost", "port": 5432}},
+    "app":      {
+        "db_url":   "postgresql://{{shared.db.host}}:{{shared.db.port}}/mydb",
+        "data_dir": "{{root}}processed/"
+    }
 }
 ```
 
-References are resolved recursively and work inside nested dicts and lists.
+References work inside nested dicts and lists too.  
+Bare `{{key}}` (no dot) is resolved from `_globals`.
 
 ## API
 
@@ -121,7 +193,7 @@ References are resolved recursively and work inside nested dicts and lists.
 |-----------|------|---------|-------------|
 | `section` | `str` | auto-detected | Config section to load |
 | `start_dir` | `str \| Path` | caller's directory | Where to start searching |
-| `logger` | `logging.Logger` | `None` | Logger for internal events |
+| `logger` | `logging.Logger` | `None` | Logger for internal debug events |
 
 ### Properties
 
@@ -133,9 +205,9 @@ References are resolved recursively and work inside nested dicts and lists.
 ### Dict-like access
 
 ```python
-cfg["key"]             # direct access (KeyError if missing)
-cfg.get("key", None)   # with default
-"key" in cfg           # membership test
+cfg["key"]                     # direct access (KeyError if missing)
+cfg.get("key", default=None)   # with default
+"key" in cfg                   # membership test
 cfg.keys() / .values() / .items()
 ```
 
