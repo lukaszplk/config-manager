@@ -13,7 +13,9 @@ from config_manager import ConfigManager
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def write_config(directory: Path, data: dict, fmt: str = "json") -> Path:
-    path = directory / f"config.{fmt}"
+    config_dir = directory / "config"
+    config_dir.mkdir(exist_ok=True)
+    path = config_dir / f"config.{fmt}"
     if fmt == "json":
         path.write_text(json.dumps(data), encoding="utf-8")
     elif fmt in ("yaml", "yml"):
@@ -23,7 +25,9 @@ def write_config(directory: Path, data: dict, fmt: str = "json") -> Path:
 
 
 def write_env(directory: Path, content: str) -> Path:
-    path = directory / ".env"
+    config_dir = directory / "config"
+    config_dir.mkdir(exist_ok=True)
+    path = config_dir / ".env"
     path.write_text(content, encoding="utf-8")
     return path
 
@@ -62,7 +66,7 @@ class TestBasicLoading:
     def test_config_path_property(self, tmp_path: Path) -> None:
         write_config(tmp_path, {"s": {}})
         cfg = ConfigManager(section="s", start_dir=tmp_path)
-        assert cfg.config_path == tmp_path / "config.json"
+        assert cfg.config_path == tmp_path / "config" / "config.json"
 
 
 # ── Parent directory search ────────────────────────────────────────────────────
