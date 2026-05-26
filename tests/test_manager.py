@@ -1,6 +1,7 @@
 """Tests for ConfigManager."""
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -18,13 +19,6 @@ def write_config(directory: Path, data: dict, fmt: str = "json") -> Path:
     elif fmt in ("yaml", "yml"):
         import yaml
         path.write_text(yaml.dump(data), encoding="utf-8")
-    elif fmt == "toml":
-        try:
-            import tomllib
-            import tomli_w
-            path.write_bytes(tomli_w.dumps(data).encode())
-        except ImportError:
-            pytest.skip("tomli_w not installed")
     return path
 
 
@@ -134,7 +128,7 @@ class TestReferenceResolution:
         cfg = ConfigManager(section="b", start_dir=tmp_path)
         assert cfg["input"] == "results/clean.csv"
 
-    def test_reference_in_string(self, tmp_path: Path) -> None:
+    def test_reference_embedded_in_string(self, tmp_path: Path) -> None:
         write_config(tmp_path, {
             "a": {"dir": "results"},
             "b": {"path": "{{a.dir}}/model.pt"},
@@ -166,11 +160,19 @@ class TestReferenceResolution:
         cfg = ConfigManager(section="b", start_dir=tmp_path)
         assert cfg["inputs"][0] == "data.csv"
 
-    def test_unresolved_reference_raises(self, tmp_path: Path) -> None:
+    def test_unresolved_section_raises_with_hint(self, tmp_path: Path) -> None:
         write_config(tmp_path, {
             "b": {"input": "{{missing.key}}"},
         })
         with pytest.raises(KeyError, match="missing"):
+            ConfigManager(section="b", start_dir=tmp_path)
+
+    def test_unresolved_key_raises_with_hint(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "a": {"x": 1},
+            "b": {"v": "{{a.no_such_key}}"},
+        })
+        with pytest.raises(KeyError, match="no_such_key"):
             ConfigManager(section="b", start_dir=tmp_path)
 
     def test_non_reference_value_unchanged(self, tmp_path: Path) -> None:
@@ -178,6 +180,88 @@ class TestReferenceResolution:
         cfg = ConfigManager(section="s", start_dir=tmp_path)
         assert cfg["n"] == 42
         assert cfg["lst"] == [1, 2]
+
+
+# ── Deep (multi-level) references ─────────────────────────────────────────────
+
+class TestDeepReferences:
+    def test_three_level_reference(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "shared": {"paths": {"raw": "data/raw.csv"}},
+            "train":  {"input": "{{shared.paths.raw}}"},
+        })
+        cfg = ConfigManager(section="train", start_dir=tmp_path)
+        assert cfg["input"] == "data/raw.csv"
+
+    def test_four_level_reference(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "shared": {"db": {"host": {"port": "5432"}}},
+            "app":    {"port": "{{shared.db.host.port}}"},
+        })
+        cfg = ConfigManager(section="app", start_dir=tmp_path)
+        assert cfg["port"] == "5432"
+
+    def test_deep_ref_missing_intermediate_key_raises(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "a": {"x": {"y": 1}},
+            "b": {"v": "{{a.x.missing}}"},
+        })
+        with pytest.raises(KeyError, match="missing"):
+            ConfigManager(section="b", start_dir=tmp_path)
+
+
+# ── _globals section ───────────────────────────────────────────────────────────
+
+class TestGlobals:
+    def test_globals_available_in_section(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "_globals": {"version": "v2", "root": "data/"},
+            "train":    {"epochs": 10},
+        })
+        cfg = ConfigManager(section="train", start_dir=tmp_path)
+        assert cfg["version"] == "v2"
+        assert cfg["root"] == "data/"
+        assert cfg["epochs"] == 10
+
+    def test_section_overrides_globals(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "_globals": {"lr": 0.001},
+            "train":    {"lr": 0.01},
+        })
+        cfg = ConfigManager(section="train", start_dir=tmp_path)
+        assert cfg["lr"] == 0.01  # section value wins
+
+    def test_reference_to_globals_via_explicit_prefix(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "_globals": {"root": "data/"},
+            "train":    {"path": "{{_globals.root}}train.csv"},
+        })
+        cfg = ConfigManager(section="train", start_dir=tmp_path)
+        assert cfg["path"] == "data/train.csv"
+
+    def test_bare_reference_resolves_from_globals(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "_globals": {"root": "data/"},
+            "train":    {"path": "{{root}}/train.csv"},
+        })
+        cfg = ConfigManager(section="train", start_dir=tmp_path)
+        assert cfg["path"] == "data//train.csv"
+
+    def test_bare_reference_missing_raises_with_hint(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "s": {"v": "{{no_section_prefix}}"},
+        })
+        with pytest.raises(KeyError, match="_globals"):
+            ConfigManager(section="s", start_dir=tmp_path)
+
+    def test_globals_not_listed_as_available_section(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "_globals": {"x": 1},
+            "s": {},
+        })
+        with pytest.raises(KeyError) as exc_info:
+            ConfigManager(section="missing", start_dir=tmp_path)
+        assert "_globals" not in str(exc_info.value)
 
 
 # ── YAML format ────────────────────────────────────────────────────────────────
@@ -188,6 +272,32 @@ class TestYamlFormat:
         write_config(tmp_path, {"s": {"key": "val"}}, fmt="yaml")
         cfg = ConfigManager(section="s", start_dir=tmp_path)
         assert cfg["key"] == "val"
+
+
+# ── Logger injection ───────────────────────────────────────────────────────────
+
+class TestLogger:
+    def test_logger_receives_debug_messages(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"s": {"k": "v"}})
+        log = logging.getLogger("test_cfg")
+        messages: list[str] = []
+        handler = logging.handlers_list = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                messages.append(record.getMessage())
+
+        log.addHandler(Capture())
+        log.setLevel(logging.DEBUG)
+        ConfigManager(section="s", start_dir=tmp_path, logger=log)
+        assert any("Config file" in m for m in messages)
+        assert any("Active section" in m for m in messages)
+
+    def test_none_logger_is_silent(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"s": {}})
+        # should not raise even with no logger
+        cfg = ConfigManager(section="s", start_dir=tmp_path, logger=None)
+        assert cfg.section == "s"
 
 
 # ── Repr ───────────────────────────────────────────────────────────────────────

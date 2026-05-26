@@ -7,7 +7,9 @@ Features:
   - Walks parent directories to find config.json / config.yaml / config.toml
   - Loads a .env file from the same directory into os.environ
   - Auto-detects the calling script's name as the active section
-  - Resolves {{section.key}} cross-references between sections
+  - Special ``_globals`` section: its values are merged into every section
+    so they are directly accessible without a prefix (section values win)
+  - Resolves ``{{section.key.subkey}}`` cross-references (arbitrary depth)
   - Supports JSON, YAML, and TOML formats
 
 Typical layout::
@@ -22,8 +24,13 @@ Typical layout::
 config.json example::
 
     {
-        "script01": {"output": "results/clean.csv"},
-        "script02": {"input": "{{script01.output}}", "model": "rf"}
+        "_globals": {"root": "data/", "version": "v2"},
+        "script01": {"output": "{{root}}clean.csv"},
+        "script02": {
+            "input":  "{{script01.output}}",
+            "model":  "rf",
+            "run_id": "{{version}}"
+        }
     }
 """
 
@@ -37,9 +44,13 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-_REF_PATTERN = re.compile(r"\{\{(\w+)\.(\w+)\}\}")
+# Matches {{any.dot.path}} — first segment is the section name (or a globals key),
+# subsequent segments are nested keys within that section.
+_REF_PATTERN = re.compile(r"\{\{([\w]+(?:\.[\w]+)*)\}\}")
+
 _CONFIG_NAMES = ("config.json", "config.yaml", "config.yml", "config.toml")
 _ENV_NAME = ".env"
+_GLOBALS_KEY = "_globals"
 
 
 def _find_config(start: Path) -> Optional[Path]:
@@ -104,27 +115,82 @@ def _load_env(env_path: Path) -> None:
             os.environ.setdefault(key, value)
 
 
-def _resolve_refs(value: Any, raw: dict) -> Any:
-    """Recursively resolve {{section.key}} references in *value*."""
+def _deep_get(data: dict, path: str) -> Any:
+    """Retrieve a value from nested dicts using a dot-separated *path*.
+
+    Raises KeyError with a descriptive message if any segment is missing.
+    """
+    keys = path.split(".")
+    current: Any = data
+    traversed: list[str] = []
+    for key in keys:
+        if not isinstance(current, dict):
+            raise KeyError(
+                f"Cannot index into {type(current).__name__!r} "
+                f"at {'.'.join(traversed)!r} (looking for key {key!r})"
+            )
+        if key not in current:
+            available = list(current.keys()) if isinstance(current, dict) else []
+            raise KeyError(
+                f"Key {key!r} not found"
+                + (f" under {'.'.join(traversed)!r}" if traversed else "")
+                + (f". Available: {available}" if available else "")
+            )
+        traversed.append(key)
+        current = current[key]
+    return current
+
+
+def _resolve_refs(value: Any, raw: dict, *, _context: str = "") -> Any:
+    """Recursively resolve ``{{path}}`` references in *value*.
+
+    *raw* is the full, unresolved config dict (all sections).
+    ``{{path}}`` — first segment is the section name; subsequent segments are
+    nested keys.  For single-segment paths (e.g. ``{{version}}``) the lookup
+    falls back to ``_globals`` if present.
+    """
     if isinstance(value, str):
         def replace(match: re.Match) -> str:
-            section, key = match.group(1), match.group(2)
-            try:
-                resolved = raw[section][key]
-            except KeyError:
-                raise KeyError(
-                    f"Config reference {{{{{section}.{key}}}}} could not be "
-                    f"resolved — section={section!r} key={key!r}"
-                )
-            return str(_resolve_refs(resolved, raw))
+            full_path = match.group(1)
+            parts = full_path.split(".", 1)
+
+            if len(parts) == 1:
+                # bare key → look in _globals first
+                key = parts[0]
+                globals_data = raw.get(_GLOBALS_KEY, {})
+                if key not in globals_data:
+                    raise KeyError(
+                        f"Reference {{{{{{ {full_path} }}}}}}: "
+                        f"no section prefix given and {key!r} not found in "
+                        f"'_globals'. Use {{{{section.{key}}}}} or add it to "
+                        f"'_globals'."
+                    )
+                resolved = globals_data[key]
+            else:
+                section, remainder = parts
+                if section not in raw:
+                    raise KeyError(
+                        f"Reference {{{{{{ {full_path} }}}}}}: "
+                        f"section {section!r} not found. "
+                        f"Available sections: {[k for k in raw if not k.startswith('_')]}"
+                    )
+                try:
+                    resolved = _deep_get(raw[section], remainder)
+                except KeyError as exc:
+                    raise KeyError(
+                        f"Reference {{{{{{ {full_path} }}}}}}: {exc}"
+                        + (f" (in {_context})" if _context else "")
+                    ) from exc
+
+            return str(_resolve_refs(resolved, raw, _context=full_path))
 
         return _REF_PATTERN.sub(replace, value)
 
     if isinstance(value, dict):
-        return {k: _resolve_refs(v, raw) for k, v in value.items()}
+        return {k: _resolve_refs(v, raw, _context=_context) for k, v in value.items()}
 
     if isinstance(value, list):
-        return [_resolve_refs(v, raw) for v in value]
+        return [_resolve_refs(v, raw, _context=_context) for v in value]
 
     return value
 
@@ -136,7 +202,6 @@ def _caller_stem() -> Optional[str]:
         path = Path(frame_info.filename).resolve()
         if path == this_file:
             continue
-        # skip pytest / standard library internals
         if any(part in path.parts for part in ("pytest", "_pytest", "pluggy")):
             continue
         stem = path.stem
@@ -154,10 +219,12 @@ class ConfigManager:
          ``config.toml`` is found.
       2. Loads ``.env`` from the same directory into ``os.environ``
          (existing env vars are never overwritten).
-      3. Determines the active *section* — defaults to the calling
+      3. Merges the special ``_globals`` section (if present) into the
+         active section — globals act as default values, section keys win.
+      4. Determines the active *section* — defaults to the calling
          script's filename stem (e.g. ``script02`` for ``script02.py``).
-      4. Resolves ``{{section.key}}`` cross-references in the active
-         section's values.
+      5. Resolves ``{{section.key.subkey}}`` cross-references in the
+         active section's values (arbitrary depth).
 
     Args:
         section: Config section to expose.  Defaults to the calling
@@ -168,22 +235,32 @@ class ConfigManager:
 
     Raises:
         FileNotFoundError: If no config file is found in any parent dir.
-        KeyError: If *section* is not present in the config file.
+        KeyError: If *section* is not present in the config file, or a
+            ``{{reference}}`` cannot be resolved.
 
-    Example::
+    Examples::
 
         # config.json
         # {
-        #   "preprocess": {"output": "results/clean.csv"},
-        #   "train":      {"input": "{{preprocess.output}}", "lr": 0.01}
+        #   "_globals": {"root": "data/", "version": "v2"},
+        #   "preprocess": {"output": "{{root}}clean.csv"},
+        #   "train": {
+        #       "input":   "{{preprocess.output}}",
+        #       "lr":      0.01,
+        #       "run_id":  "{{version}}"
+        #   }
         # }
 
         # train.py
         from config_manager import ConfigManager
-        cfg = ConfigManager()           # section="train" auto-detected
-        cfg["input"]                    # → "results/clean.csv"
-        cfg["lr"]                       # → 0.01
-        cfg.get("missing", "default")   # → "default"
+
+        log = logging.getLogger(__name__)
+        cfg = ConfigManager(logger=log)     # section="train" auto-detected
+
+        cfg["input"]                        # → "data/clean.csv"
+        cfg["lr"]                           # → 0.01
+        cfg["version"]                      # → "v2"  (from _globals)
+        cfg.get("missing", "default")       # → "default"
     """
 
     def __init__(
@@ -199,7 +276,6 @@ class ConfigManager:
         if start_dir is not None:
             search_root = Path(start_dir).resolve()
         else:
-            # use caller's directory
             caller_frame = inspect.stack()[1]
             search_root = Path(caller_frame.filename).resolve().parent
 
@@ -229,16 +305,24 @@ class ConfigManager:
                 "Could not auto-detect section name. "
                 "Pass section= explicitly."
             )
+
+        available = [k for k in raw if not k.startswith("_")]
         if section not in raw:
             raise KeyError(
-                f"Section {section!r} not found in {config_path}. "
-                f"Available: {list(raw)}"
+                f"Section {section!r} not found in {config_path.name}. "
+                f"Available: {available}"
             )
         if self._log:
-            self._log.debug("Active section: %r", section)
+            self._log.debug(
+                "Active section: %r  |  globals: %s  |  config: %s",
+                section,
+                list(raw.get(_GLOBALS_KEY, {}).keys()),
+                config_path,
+            )
 
-        # resolve cross-references
-        self._data: dict = _resolve_refs(raw[section], raw)
+        # merge _globals (base) + section (wins) → resolve references
+        merged: dict = {**raw.get(_GLOBALS_KEY, {}), **raw[section]}
+        self._data: dict = _resolve_refs(merged, raw, _context=section)
         self._section = section
         self._config_path = config_path
 
