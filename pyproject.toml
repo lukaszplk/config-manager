@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "config-manager"
+version = "0.1.0"
+description = "Hierarchical config loader with cross-section reference resolution for data-processing pipelines"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+keywords = ["config", "pipeline", "dotenv", "data-processing"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6"]
+toml = ["tomli>=2; python_version<'3.11'"]
+dev = ["pytest>=7", "pyyaml>=6"]
+
+[project.urls]
+Homepage = "https://github.com/lukaszplk/config-manager"
+Repository = "https://github.com/lukaszplk/config-manager"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/config_manager"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
