@@ -345,6 +345,22 @@ class TestAttributeAccess:
         assert "valid_key" in members
         assert "also-invalid" not in members
 
+    def test_digit_leading_key_accessible_with_underscore_prefix(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"s": {"01_preprocess": "step1", "02_train": "step2"}})
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        assert cfg._01_preprocess == "step1"
+        assert cfg._02_train == "step2"
+
+    def test_digit_leading_key_in_dir(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"s": {"01_preprocess": "step1"}})
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        assert "_01_preprocess" in dir(cfg)
+
+    def test_digit_leading_key_consistent_with_item_access(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"s": {"01_preprocess": "step1"}})
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        assert cfg._01_preprocess == cfg["01_preprocess"]
+
     def test_attribute_access_consistent_with_item_access(self, tmp_path: Path) -> None:
         write_config(tmp_path, {
             "_globals": {"root": "data/"},

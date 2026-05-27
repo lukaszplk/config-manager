@@ -240,6 +240,25 @@ def _wrap(value: Any) -> Any:
     return value
 
 
+def _attr_name(key: str) -> Optional[str]:
+    """Return the attribute name for *key*, or ``None`` if no mapping exists.
+
+    Keys that are already valid identifiers map to themselves.
+    Keys that start with one or more digits get a ``_`` prefix so that
+    e.g. ``"01_preprocess"`` becomes ``"_01_preprocess"`` — a valid
+    identifier that can be typed as ``cfg._01_preprocess``.
+    Keys containing other invalid characters (e.g. hyphens) are not
+    mapped and remain dict-access only.
+    """
+    if key.isidentifier():
+        return key
+    if key and key[0].isdigit():
+        candidate = "_" + key
+        if candidate.isidentifier():
+            return candidate
+    return None
+
+
 def _unwrap(value: Any) -> Any:
     """Recursively unwrap _Namespace objects back to plain dicts."""
     if isinstance(value, _Namespace):
@@ -266,16 +285,22 @@ class _Namespace:
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
             raise AttributeError(name)
-        try:
+        # Exact key match first.
+        if name in self._data:
             return _wrap(self._data[name])
-        except KeyError:
-            raise AttributeError(
-                f"No config key {name!r}. Available: {list(self._data.keys())}"
-            ) from None
+        # Digit-leading key: "_01_foo" → look up "01_foo".
+        if name.startswith("_") and len(name) > 1 and name[1].isdigit():
+            stripped = name[1:]
+            if stripped in self._data:
+                return _wrap(self._data[stripped])
+        raise AttributeError(
+            f"No config key {name!r}. Available: {list(self._data.keys())}"
+        )
 
     def __dir__(self) -> list[str]:
         base: list[str] = list(object.__dir__(self))
-        return base + [k for k in self._data if isinstance(k, str) and k.isidentifier()]
+        return base + [a for k in self._data
+                       if isinstance(k, str) and (a := _attr_name(k)) is not None]
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("ConfigManager values are read-only")
@@ -491,24 +516,31 @@ class ConfigManager:
         # confusing RecursionError when _data is not yet set.
         if name.startswith("__"):
             raise AttributeError(name)
-        try:
+        # Exact key match first.
+        if name in self._data:
             return _wrap(self._data[name])
-        except KeyError:
-            raise AttributeError(
-                f"{type(self).__name__!r} has no attribute {name!r}. "
-                f"Available keys: {list(self._data.keys())}"
-            ) from None
+        # Digit-leading key: "_01_foo" → look up "01_foo".
+        if name.startswith("_") and len(name) > 1 and name[1].isdigit():
+            stripped = name[1:]
+            if stripped in self._data:
+                return _wrap(self._data[stripped])
+        raise AttributeError(
+            f"{type(self).__name__!r} has no attribute {name!r}. "
+            f"Available keys: {list(self._data.keys())}"
+        )
 
     def __dir__(self) -> list[str]:
         """Extend the default dir() with config keys.
 
         This makes tab-completion work in IPython, Jupyter, and IDEs that
         use ``__dir__`` for attribute suggestions (e.g. Pylance in VS Code).
-        Only valid Python identifiers are added; keys like ``"my-key"``
-        cannot be accessed as attributes and are omitted.
+        Keys that start with a digit are exposed with a ``_`` prefix so that
+        e.g. ``"01_preprocess"`` appears as ``_01_preprocess`` in completion.
+        Keys with other invalid characters (hyphens etc.) are omitted.
         """
         base: list[str] = super().__dir__()
-        config_keys = [k for k in self._data if isinstance(k, str) and k.isidentifier()]
+        config_keys = [a for k in self._data
+                       if isinstance(k, str) and (a := _attr_name(k)) is not None]
         return base + config_keys
 
     # ── Introspection ──────────────────────────────────────────────────────────
