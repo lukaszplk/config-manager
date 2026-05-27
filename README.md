@@ -16,12 +16,12 @@ A lightweight, zero-dependency config loader for Python data-processing pipeline
 ## Install
 
 ```bash
-pip install config-manager
+pip install refconf-manager
 ```
 
 With YAML support:
 ```bash
-pip install "config-manager[yaml]"
+pip install "refconf-manager[yaml]"
 ```
 
 ## Quick start
@@ -56,7 +56,7 @@ project/
 
 **train.py**
 ```python
-from config_manager import ConfigManager
+from refconf_manager import ConfigManager
 
 cfg = ConfigManager()       # section="train" detected from filename
 
@@ -175,7 +175,7 @@ Pass your own logger to capture config loading events at `DEBUG` level.
 
 ```python
 import logging
-from config_manager import ConfigManager
+from refconf_manager import ConfigManager
 
 logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
@@ -315,3 +315,5 @@ cd config-manager
 pip install -e ".[dev]"
 pytest
 ```
+
+> The PyPI package is `refconf-manager`; the import name is `refconf_manager`.

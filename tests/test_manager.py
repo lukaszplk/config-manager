@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from config_manager import ConfigManager
+from refconf_manager import ConfigManager
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
