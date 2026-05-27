@@ -14,14 +14,17 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # full history needed for hatch-vcs version inference
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install
-        run: pip install -e ".[dev]"
+      - name: Install package and test dependencies
+        run: pip install -e ".[dev]" pytest
 
-      - name: Test
-        run: pytest
+      - name: Run tests
+        run: pytest --tb=short

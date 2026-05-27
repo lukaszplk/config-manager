@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"   # triggers on v1.0.0, v1.1.0, etc.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # full history needed for hatch-vcs version inference
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: pytest --tb=short
+
+  publish:
+    needs: test          # only runs if tests pass
+    runs-on: ubuntu-latest
+    environment: pypi    # requires manual approval in GitHub repo settings
+    permissions:
+      id-token: write    # needed for PyPI trusted publishing (no token required)
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # full history needed for hatch-vcs version inference
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Build
+        run: |
+          pip install hatchling hatch-vcs build
+          python -m build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

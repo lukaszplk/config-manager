@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "config-manager"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Hierarchical config loader with cross-section reference resolution for data-processing pipelines"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -29,6 +29,9 @@ dev = ["pytest>=7", "pyyaml>=6"]
 [project.urls]
 Homepage = "https://github.com/lukaszplk/config-manager"
 Repository = "https://github.com/lukaszplk/config-manager"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/config_manager"]
