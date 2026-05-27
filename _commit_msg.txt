@@ -1,8 +1,0 @@
-Rename package to refconf-manager / refconf_manager
-
-config-manager is already taken on PyPI. Rename:
-- PyPI distribution: config-manager -> refconf-manager
-- Import name: config_manager -> refconf_manager (src/ dir renamed)
-- pyproject.toml, tests, and README updated accordingly
-
-Co-authored-by: Cursor <cursoragent@cursor.com>
