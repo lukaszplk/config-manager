@@ -162,17 +162,35 @@ def _resolve_env(value: str) -> str:
     return _ENV_PATTERN.sub(replace, value)
 
 
-def _resolve_refs(value: Any, raw: dict, *, _context: str = "") -> Any:
+def _resolve_refs(
+    value: Any,
+    raw: dict,
+    *,
+    _context: str = "",
+    _resolving: frozenset[str] = frozenset(),
+) -> Any:
     """Recursively resolve ``{{path}}`` references in *value*.
 
     *raw* is the full, unresolved config dict (all sections).
     ``{{path}}`` — first segment is the section name; subsequent segments are
     nested keys.  For single-segment paths (e.g. ``{{version}}``) the lookup
     falls back to ``_globals`` if present.
+
+    *_resolving* tracks the set of reference paths currently being resolved to
+    detect cycles and raise a clear error instead of hitting Python's recursion
+    limit.
     """
     if isinstance(value, str):
         def replace(match: re.Match) -> str:
             full_path = match.group(1)
+
+            if full_path in _resolving:
+                cycle = " -> ".join(sorted(_resolving)) + f" -> {full_path}"
+                raise KeyError(
+                    f"Circular reference detected: {{{{{full_path}}}}} "
+                    f"is already being resolved. Cycle: {cycle}"
+                )
+
             parts = full_path.split(".", 1)
 
             if len(parts) == 1:
@@ -203,15 +221,21 @@ def _resolve_refs(value: Any, raw: dict, *, _context: str = "") -> Any:
                         + (f" (in {_context})" if _context else "")
                     ) from exc
 
-            return str(_resolve_refs(resolved, raw, _context=full_path))
+            return str(_resolve_refs(
+                resolved, raw,
+                _context=full_path,
+                _resolving=_resolving | {full_path},
+            ))
 
         return _resolve_env(_REF_PATTERN.sub(replace, value))
 
     if isinstance(value, dict):
-        return {k: _resolve_refs(v, raw, _context=_context) for k, v in value.items()}
+        return {k: _resolve_refs(v, raw, _context=_context, _resolving=_resolving)
+                for k, v in value.items()}
 
     if isinstance(value, list):
-        return [_resolve_refs(v, raw, _context=_context) for v in value]
+        return [_resolve_refs(v, raw, _context=_context, _resolving=_resolving)
+                for v in value]
 
     return value
 

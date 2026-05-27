@@ -1,6 +1,7 @@
-# config-manager
+# refconf-manager
 
 [![CI](https://github.com/lukaszplk/config-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/lukaszplk/config-manager/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/refconf-manager)](https://pypi.org/project/refconf-manager/)
 
 A lightweight, zero-dependency config loader for Python data-processing pipelines.
 

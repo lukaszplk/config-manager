@@ -228,6 +228,21 @@ class TestDeepReferences:
         with pytest.raises(KeyError, match="missing"):
             ConfigManager(section="b", start_dir=tmp_path)
 
+    def test_circular_reference_raises(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "a": {"x": "{{b.y}}"},
+            "b": {"y": "{{a.x}}"},
+        })
+        with pytest.raises(KeyError, match="[Cc]ircular"):
+            ConfigManager(section="a", start_dir=tmp_path)
+
+    def test_self_referencing_raises(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "a": {"x": "{{a.x}}"},
+        })
+        with pytest.raises(KeyError, match="[Cc]ircular"):
+            ConfigManager(section="a", start_dir=tmp_path)
+
 
 # ── _globals section ───────────────────────────────────────────────────────────
 
