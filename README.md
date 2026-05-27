@@ -9,6 +9,8 @@ A lightweight, zero-dependency config loader for Python data-processing pipeline
 - **Auto-detects** the calling script's name as the active section — no boilerplate
 - Special **`_globals` section** — its values are merged into every section automatically
 - Resolves **`{{section.key.subkey}}`** cross-references at arbitrary depth
+- Interpolates **`${ENV_VAR}`** placeholders from `os.environ` in string values
+- Attribute-style access with IDE tab-completion (`cfg.lr`, `cfg.paths.raw`)
 - Clear error messages when a reference can't be resolved
 
 ## Install
@@ -59,7 +61,9 @@ from config_manager import ConfigManager
 cfg = ConfigManager()       # section="train" detected from filename
 
 cfg["input"]                # → "data/clean.csv"  (resolved via preprocess)
+cfg.input                   # → "data/clean.csv"  (attribute-style shorthand)
 cfg["lr"]                   # → 0.01
+cfg.lr                      # → 0.01
 cfg["version"]              # → "v2"  (injected from _globals)
 cfg["run_id"]               # → "v2"
 cfg.get("device", "cpu")    # → "cpu"  (default)
@@ -121,7 +125,51 @@ cfg = ConfigManager()
 cfg["output"]   # → "my-bucket/runs/model.pt"
 ```
 
-### 4 — Logger injection
+### 4 — Nested attribute access
+
+When a config value is itself a dict, attribute access returns a namespace object that supports the same interface — including further attribute access, `__dir__`, `len()`, and iteration.
+
+```json
+{
+    "train": {
+        "db": { "host": "localhost", "port": 5432 }
+    }
+}
+```
+
+```python
+cfg = ConfigManager()
+cfg.db.host          # → "localhost"
+cfg.db.port          # → 5432
+cfg.db == {"host": "localhost", "port": 5432}   # → True
+cfg.db.to_dict()     # → {"host": "localhost", "port": 5432}
+```
+
+### 5 — Environment variable interpolation
+
+Use `${VAR}` in any string value. Variables from the `.env` file are available too.
+
+```json
+{
+    "app": {
+        "db_url": "postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}/mydb"
+    }
+}
+```
+
+```
+# config/.env
+DB_HOST=localhost
+DB_USER=admin
+DB_PASS=secret
+```
+
+```python
+cfg = ConfigManager()
+cfg["db_url"]   # → "postgresql://admin:secret@localhost/mydb"
+```
+
+### 6 — Logger injection
 
 Pass your own logger to capture config loading events at `DEBUG` level.
 
@@ -137,7 +185,7 @@ cfg = ConfigManager(logger=log)
 # DEBUG config_manager: Active section: 'train' | globals: ['root', 'version'] | ...
 ```
 
-### 5 — Override section or root
+### 7 — Override section or root
 
 ```python
 # Load a specific section explicitly
@@ -203,6 +251,21 @@ Use `{{section.key}}` or `{{section.key.subkey.deeper}}` in any string value:
 References work inside nested dicts and lists too.  
 Bare `{{key}}` (no dot) is resolved from `_globals`.
 
+## Environment variable syntax
+
+Use `${VAR}` to interpolate `os.environ` values in any string. Substitution happens after `{{}}` reference resolution, so both syntaxes can coexist:
+
+```json
+{
+    "app": {
+        "host":   "${DB_HOST}",
+        "db_url": "postgresql://${DB_USER}@${DB_HOST}/{{_globals.db_name}}"
+    }
+}
+```
+
+Variables set in `config/.env` are loaded before interpolation, so they are available as `${VAR}` too. A missing variable raises `KeyError` with a clear message.
+
 ## API
 
 ### `ConfigManager(section=None, *, start_dir=None, logger=None)`
@@ -220,14 +283,29 @@ Bare `{{key}}` (no dot) is resolved from `_globals`.
 | `section` | `str` | Active section name |
 | `config_path` | `Path` | Resolved path to the config file |
 
-### Dict-like access
+### Dict-like and attribute-style access
 
 ```python
-cfg["key"]                     # direct access (KeyError if missing)
+cfg["key"]                     # dict-style access (KeyError if missing)
+cfg.key                        # attribute-style shorthand (AttributeError if missing)
 cfg.get("key", default=None)   # with default
 "key" in cfg                   # membership test
+len(cfg)                       # number of keys in the active section
+for k in cfg: ...              # iterate over keys
 cfg.keys() / .values() / .items()
+cfg.to_dict()                  # plain dict (recursively unwraps nested namespaces)
 ```
+
+Attribute-style access also enables **IDE tab-completion**: type `cfg.` and your editor
+will suggest the keys loaded from the active section (Pylance, Jedi, IPython, Jupyter).
+Nested dict values return a `_Namespace` object that supports the same interface,
+so `cfg.db.host` and `dir(cfg.db)` both work.
+
+> **Note:** if a config key shares a name with a built-in method (e.g. `get`, `keys`),
+> the method wins on attribute access. Use `cfg["get"]` in that case.
+
+> **Note:** `ConfigManager` is read-only — assigning to any public attribute raises
+> `AttributeError`.
 
 ## Development
 

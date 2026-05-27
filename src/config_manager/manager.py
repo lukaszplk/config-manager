@@ -10,6 +10,7 @@ Features:
   - Special ``_globals`` section: its values are merged into every section
     so they are directly accessible without a prefix (section values win)
   - Resolves ``{{section.key.subkey}}`` cross-references (arbitrary depth)
+  - Interpolates ``${ENV_VAR}`` placeholders from os.environ in string values
   - Supports JSON, YAML, and TOML formats
 
 Typical layout::
@@ -43,11 +44,14 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 # Matches {{any.dot.path}} — first segment is the section name (or a globals key),
 # subsequent segments are nested keys within that section.
 _REF_PATTERN = re.compile(r"\{\{([\w]+(?:\.[\w]+)*)\}\}")
+
+# Matches ${ENV_VAR} for os.environ interpolation.
+_ENV_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
 _CONFIG_DIR = "config"
 _CONFIG_NAMES = ("config.json", "config.yaml", "config.yml", "config.toml")
@@ -143,6 +147,21 @@ def _deep_get(data: dict, path: str) -> Any:
     return current
 
 
+def _resolve_env(value: str) -> str:
+    """Substitute ``${VAR}`` placeholders with values from ``os.environ``.
+
+    Raises:
+        KeyError: If a referenced environment variable is not set.
+    """
+    def replace(match: re.Match) -> str:
+        var = match.group(1)
+        if var not in os.environ:
+            raise KeyError(f"Environment variable ${{{var}}} is not set")
+        return os.environ[var]
+
+    return _ENV_PATTERN.sub(replace, value)
+
+
 def _resolve_refs(value: Any, raw: dict, *, _context: str = "") -> Any:
     """Recursively resolve ``{{path}}`` references in *value*.
 
@@ -186,7 +205,7 @@ def _resolve_refs(value: Any, raw: dict, *, _context: str = "") -> Any:
 
             return str(_resolve_refs(resolved, raw, _context=full_path))
 
-        return _REF_PATTERN.sub(replace, value)
+        return _resolve_env(_REF_PATTERN.sub(replace, value))
 
     if isinstance(value, dict):
         return {k: _resolve_refs(v, raw, _context=_context) for k, v in value.items()}
@@ -210,6 +229,96 @@ def _caller_stem() -> Optional[str]:
         if stem not in ("<string>", "<stdin>"):
             return stem
     return None
+
+
+def _wrap(value: Any) -> Any:
+    """Wrap nested dicts in _Namespace so attribute access works at any depth."""
+    if isinstance(value, dict):
+        return _Namespace(value)
+    if isinstance(value, list):
+        return [_wrap(v) for v in value]
+    return value
+
+
+def _unwrap(value: Any) -> Any:
+    """Recursively unwrap _Namespace objects back to plain dicts."""
+    if isinstance(value, _Namespace):
+        return {k: _unwrap(v) for k, v in value._data.items()}
+    if isinstance(value, list):
+        return [_unwrap(v) for v in value]
+    return value
+
+
+class _Namespace:
+    """Read-only attribute-access wrapper for a plain dict.
+
+    Returned by :class:`ConfigManager` when a value is itself a dict, enabling
+    ``cfg.paths.raw`` instead of ``cfg["paths"]["raw"]``.
+    """
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: dict) -> None:
+        object.__setattr__(self, "_data", data)
+
+    # ── Attribute access ───────────────────────────────────────────────────────
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        try:
+            return _wrap(self._data[name])
+        except KeyError:
+            raise AttributeError(
+                f"No config key {name!r}. Available: {list(self._data.keys())}"
+            ) from None
+
+    def __dir__(self) -> list[str]:
+        base: list[str] = list(object.__dir__(self))
+        return base + [k for k in self._data if isinstance(k, str) and k.isidentifier()]
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("ConfigManager values are read-only")
+
+    # ── Mapping-like interface ─────────────────────────────────────────────────
+
+    def __getitem__(self, key: str) -> Any:
+        return _wrap(self._data[key])
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._data
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return _wrap(self._data[key]) if key in self._data else default
+
+    def keys(self):
+        return self._data.keys()
+
+    def values(self):
+        return (_wrap(v) for v in self._data.values())
+
+    def items(self):
+        return ((k, _wrap(v)) for k, v in self._data.items())
+
+    def to_dict(self) -> dict:
+        """Return a plain dict, recursively converting any nested _Namespace objects."""
+        return {k: _unwrap(v) for k, v in self._data.items()}
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _Namespace):
+            return self._data == other._data
+        if isinstance(other, dict):
+            return self._data == other
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return repr(self._data)
 
 
 class ConfigManager:
@@ -261,6 +370,7 @@ class ConfigManager:
 
         cfg["input"]                        # → "data/clean.csv"
         cfg["lr"]                           # → 0.01
+        cfg.lr                              # → 0.01  (attribute-style shorthand)
         cfg["version"]                      # → "v2"  (from _globals)
         cfg.get("missing", "default")       # → "default"
     """
@@ -331,22 +441,75 @@ class ConfigManager:
     # ── Mapping interface ──────────────────────────────────────────────────────
 
     def __getitem__(self, key: str) -> Any:
-        return self._data[key]
+        return _wrap(self._data[key])
 
-    def __contains__(self, key: str) -> bool:
+    def __contains__(self, key: object) -> bool:
         return key in self._data
 
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
     def get(self, key: str, default: Any = None) -> Any:
-        return self._data.get(key, default)
+        return _wrap(self._data[key]) if key in self._data else default
 
     def keys(self):
         return self._data.keys()
 
     def values(self):
-        return self._data.values()
+        return (_wrap(v) for v in self._data.values())
 
     def items(self):
-        return self._data.items()
+        return ((k, _wrap(v)) for k, v in self._data.items())
+
+    def to_dict(self) -> dict:
+        """Return a plain dict, recursively converting any nested _Namespace objects."""
+        return {k: _unwrap(v) for k, v in self._data.items()}
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+        else:
+            raise AttributeError("ConfigManager values are read-only")
+
+    # ── Attribute-style access ─────────────────────────────────────────────────
+
+    def __getattr__(self, name: str) -> Any:
+        """Enable ``cfg.key`` as a shorthand for ``cfg["key"]``.
+
+        Only reached when normal attribute lookup fails (i.e. not for
+        properties or methods defined on the class).  If a config key
+        shares a name with a built-in method (e.g. ``get``, ``keys``),
+        the method wins — use ``cfg["get"]`` in that case.
+
+        Raises:
+            AttributeError: If *name* is not a key in the active section.
+        """
+        # Guard against dunder lookups (pickle, copy, etc.) to avoid
+        # confusing RecursionError when _data is not yet set.
+        if name.startswith("__"):
+            raise AttributeError(name)
+        try:
+            return _wrap(self._data[name])
+        except KeyError:
+            raise AttributeError(
+                f"{type(self).__name__!r} has no attribute {name!r}. "
+                f"Available keys: {list(self._data.keys())}"
+            ) from None
+
+    def __dir__(self) -> list[str]:
+        """Extend the default dir() with config keys.
+
+        This makes tab-completion work in IPython, Jupyter, and IDEs that
+        use ``__dir__`` for attribute suggestions (e.g. Pylance in VS Code).
+        Only valid Python identifiers are added; keys like ``"my-key"``
+        cannot be accessed as attributes and are omitted.
+        """
+        base: list[str] = super().__dir__()
+        config_keys = [k for k in self._data if isinstance(k, str) and k.isidentifier()]
+        return base + config_keys
 
     # ── Introspection ──────────────────────────────────────────────────────────
 
