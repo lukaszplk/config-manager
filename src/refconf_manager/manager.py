@@ -43,8 +43,9 @@ import json
 import logging
 import os
 import re
+from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any
 
 # Matches {{any.dot.path}} — first segment is the section name (or a globals key),
 # subsequent segments are nested keys within that section.
@@ -59,7 +60,7 @@ _ENV_NAME = ".env"
 _GLOBALS_KEY = "_globals"
 
 
-def _find_config(start: Path) -> Optional[Path]:
+def _find_config(start: Path) -> Path | None:
     """Walk from *start* upward until a ``config/<file>`` is found."""
     current = start.resolve()
     while True:
@@ -79,7 +80,7 @@ def _load_file(path: Path) -> dict:
     text = path.read_text(encoding="utf-8")
 
     if suffix == ".json":
-        return json.loads(text)
+        return json.loads(text)  # type: ignore[no-any-return]
 
     if suffix in (".yaml", ".yml"):
         try:
@@ -88,7 +89,7 @@ def _load_file(path: Path) -> dict:
             raise ImportError(
                 "PyYAML is required for YAML config files: pip install pyyaml"
             ) from e
-        return yaml.safe_load(text) or {}
+        return yaml.safe_load(text) or {}  # type: ignore[no-any-return]
 
     if suffix == ".toml":
         try:
@@ -101,13 +102,16 @@ def _load_file(path: Path) -> dict:
                     "tomli is required for TOML config files on Python <3.11: "
                     "pip install tomli"
                 ) from e
-        return tomllib.loads(text)
+        return tomllib.loads(text)  # type: ignore[no-any-return]
 
     raise ValueError(f"Unsupported config format: {path.suffix}")
 
 
 def _load_env(env_path: Path) -> None:
-    """Parse a .env file and set variables into os.environ (skip if missing)."""
+    """Parse a .env file and set variables into os.environ (skip if missing).
+
+    Supports ``export KEY=value`` shell syntax and skips blank lines / comments.
+    """
     if not env_path.is_file():
         return
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -116,6 +120,8 @@ def _load_env(env_path: Path) -> None:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
         value = value.strip().strip('"').strip("'")
         if key:
             os.environ.setdefault(key, value)
@@ -162,6 +168,47 @@ def _resolve_env(value: str) -> str:
     return _ENV_PATTERN.sub(replace, value)
 
 
+def _lookup_ref(full_path: str, raw: dict, _context: str) -> Any:
+    """Look up *full_path* in *raw* and return the raw (unresolved) value.
+
+    Cross-section lookups use the globals-merged view of the target section so
+    that ``{{B.key}}`` sees the same keys that ``ConfigManager(section="B")``
+    would expose (globals injected as defaults, section values win).
+    """
+    parts = full_path.split(".", 1)
+
+    if len(parts) == 1:
+        # Bare key → look in _globals
+        key = parts[0]
+        globals_data = raw.get(_GLOBALS_KEY, {})
+        if key not in globals_data:
+            raise KeyError(
+                f"Reference {{{{{{ {full_path} }}}}}}: "
+                f"no section prefix given and {key!r} not found in "
+                f"'_globals'. Use {{{{section.{key}}}}} or add it to "
+                f"'_globals'."
+            )
+        return globals_data[key]
+
+    section, remainder = parts
+    if section not in raw:
+        raise KeyError(
+            f"Reference {{{{{{ {full_path} }}}}}}: "
+            f"section {section!r} not found. "
+            f"Available sections: {[k for k in raw if not k.startswith('_')]}"
+        )
+    # Merge globals into target section so cross-section refs are consistent
+    # with what ConfigManager(section=section) would expose.
+    merged_section = {**raw.get(_GLOBALS_KEY, {}), **raw[section]}
+    try:
+        return _deep_get(merged_section, remainder)
+    except KeyError as exc:
+        raise KeyError(
+            f"Reference {{{{{{ {full_path} }}}}}}: {exc}"
+            + (f" (in {_context})" if _context else "")
+        ) from exc
+
+
 def _resolve_refs(
     value: Any,
     raw: dict,
@@ -169,58 +216,47 @@ def _resolve_refs(
     _context: str = "",
     _resolving: frozenset[str] = frozenset(),
 ) -> Any:
-    """Recursively resolve ``{{path}}`` references in *value*.
+    """Recursively resolve ``{{path}}`` references and ``${VAR}`` placeholders.
 
     *raw* is the full, unresolved config dict (all sections).
-    ``{{path}}`` — first segment is the section name; subsequent segments are
-    nested keys.  For single-segment paths (e.g. ``{{version}}``) the lookup
-    falls back to ``_globals`` if present.
+    *_resolving* tracks the reference chain for cycle detection.
 
-    *_resolving* tracks the set of reference paths currently being resolved to
-    detect cycles and raise a clear error instead of hitting Python's recursion
-    limit.
+    Type preservation
+    -----------------
+    When the **entire** string value is a single ``{{ref}}`` (e.g. ``"{{a.lr}}"``),
+    the resolved value is returned with its original type (float, int, bool, …).
+    When the reference is embedded inside a larger string (e.g. ``"{{root}}/data"``),
+    string coercion applies as normal.
     """
     if isinstance(value, str):
-        def replace(match: re.Match) -> str:
-            full_path = match.group(1)
-
+        # ── Fast path: sole reference → preserve resolved type ──────────────
+        sole = _REF_PATTERN.fullmatch(value)
+        if sole:
+            full_path = sole.group(1)
             if full_path in _resolving:
                 cycle = " -> ".join(sorted(_resolving)) + f" -> {full_path}"
                 raise KeyError(
                     f"Circular reference detected: {{{{{full_path}}}}} "
                     f"is already being resolved. Cycle: {cycle}"
                 )
+            resolved = _lookup_ref(full_path, raw, _context)
+            result = _resolve_refs(
+                resolved, raw,
+                _context=full_path,
+                _resolving=_resolving | {full_path},
+            )
+            return _resolve_env(result) if isinstance(result, str) else result
 
-            parts = full_path.split(".", 1)
-
-            if len(parts) == 1:
-                # bare key → look in _globals first
-                key = parts[0]
-                globals_data = raw.get(_GLOBALS_KEY, {})
-                if key not in globals_data:
-                    raise KeyError(
-                        f"Reference {{{{{{ {full_path} }}}}}}: "
-                        f"no section prefix given and {key!r} not found in "
-                        f"'_globals'. Use {{{{section.{key}}}}} or add it to "
-                        f"'_globals'."
-                    )
-                resolved = globals_data[key]
-            else:
-                section, remainder = parts
-                if section not in raw:
-                    raise KeyError(
-                        f"Reference {{{{{{ {full_path} }}}}}}: "
-                        f"section {section!r} not found. "
-                        f"Available sections: {[k for k in raw if not k.startswith('_')]}"
-                    )
-                try:
-                    resolved = _deep_get(raw[section], remainder)
-                except KeyError as exc:
-                    raise KeyError(
-                        f"Reference {{{{{{ {full_path} }}}}}}: {exc}"
-                        + (f" (in {_context})" if _context else "")
-                    ) from exc
-
+        # ── General path: ref embedded in string → str coercion ────────────
+        def replace(match: re.Match) -> str:
+            full_path = match.group(1)
+            if full_path in _resolving:
+                cycle = " -> ".join(sorted(_resolving)) + f" -> {full_path}"
+                raise KeyError(
+                    f"Circular reference detected: {{{{{full_path}}}}} "
+                    f"is already being resolved. Cycle: {cycle}"
+                )
+            resolved = _lookup_ref(full_path, raw, _context)
             return str(_resolve_refs(
                 resolved, raw,
                 _context=full_path,
@@ -240,7 +276,7 @@ def _resolve_refs(
     return value
 
 
-def _caller_stem() -> Optional[str]:
+def _caller_stem() -> str | None:
     """Return the stem of the first non-library frame's filename."""
     this_file = Path(__file__).resolve()
     for frame_info in inspect.stack():
@@ -250,7 +286,7 @@ def _caller_stem() -> Optional[str]:
         if any(part in path.parts for part in ("pytest", "_pytest", "pluggy")):
             continue
         stem = path.stem
-        if stem not in ("<string>", "<stdin>"):
+        if stem not in ("<string>", "<stdin>", "__main__"):
             return stem
     return None
 
@@ -264,7 +300,7 @@ def _wrap(value: Any) -> Any:
     return value
 
 
-def _attr_name(key: str) -> Optional[str]:
+def _attr_name(key: str) -> str | None:
     """Return the attribute name for *key*, or ``None`` if no mapping exists.
 
     Keys that are already valid identifiers map to themselves.
@@ -292,14 +328,16 @@ def _unwrap(value: Any) -> Any:
     return value
 
 
-class _Namespace:
+class _Namespace(Mapping):
     """Read-only attribute-access wrapper for a plain dict.
 
-    Returned by :class:`ConfigManager` when a value is itself a dict, enabling
-    ``cfg.paths.raw`` instead of ``cfg["paths"]["raw"]``.
+    Implements :class:`collections.abc.Mapping` for full duck-typing
+    compatibility.  Returned by :class:`ConfigManager` when a value is itself
+    a dict, enabling ``cfg.paths.raw`` instead of ``cfg["paths"]["raw"]``.
     """
 
     __slots__ = ("_data",)
+    __hash__ = None  # type: ignore[assignment]
 
     def __init__(self, data: dict) -> None:
         object.__setattr__(self, "_data", data)
@@ -343,17 +381,8 @@ class _Namespace:
     def __len__(self) -> int:
         return len(self._data)
 
-    def get(self, key: str, default: Any = None) -> Any:
+    def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
         return _wrap(self._data[key]) if key in self._data else default
-
-    def keys(self):
-        return self._data.keys()
-
-    def values(self):
-        return (_wrap(v) for v in self._data.values())
-
-    def items(self):
-        return ((k, _wrap(v)) for k, v in self._data.items())
 
     def to_dict(self) -> dict:
         """Return a plain dict, recursively converting any nested _Namespace objects."""
@@ -361,30 +390,38 @@ class _Namespace:
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, _Namespace):
-            return self._data == other._data
+            return bool(self._data == other._data)
         if isinstance(other, dict):
-            return self._data == other
+            return bool(self._data == other)
         return NotImplemented
 
     def __repr__(self) -> str:
         return repr(self._data)
 
 
-class ConfigManager:
+class ConfigManager(Mapping):
     """Hierarchical config loader with cross-section reference resolution.
+
+    Implements :class:`collections.abc.Mapping` for full duck-typing
+    compatibility (``isinstance(cfg, Mapping)`` is ``True``).
 
     On construction:
       1. Walks parent directories from the calling script's location
          (or *start_dir*) until ``config.json`` / ``config.yaml`` /
          ``config.toml`` is found.
       2. Loads ``.env`` from the same directory into ``os.environ``
-         (existing env vars are never overwritten).
+         (existing env vars are never overwritten).  Supports
+         ``export KEY=value`` shell syntax.
       3. Merges the special ``_globals`` section (if present) into the
          active section — globals act as default values, section keys win.
       4. Determines the active *section* — defaults to the calling
          script's filename stem (e.g. ``script02`` for ``script02.py``).
       5. Resolves ``{{section.key.subkey}}`` cross-references in the
-         active section's values (arbitrary depth).
+         active section's values (arbitrary depth, with cycle detection).
+         Cross-section lookups see the target section's globals-merged view,
+         consistent with ``ConfigManager(section=target)``.
+      6. When the **entire** value is a sole ``{{ref}}``, the resolved type
+         (float, int, bool, …) is preserved — no silent str coercion.
 
     Args:
         section: Config section to expose.  Defaults to the calling
@@ -396,7 +433,9 @@ class ConfigManager:
     Raises:
         FileNotFoundError: If no config file is found in any parent dir.
         KeyError: If *section* is not present in the config file, or a
-            ``{{reference}}`` cannot be resolved.
+            ``{{reference}}`` cannot be resolved (including circular refs).
+        ValueError: If the section cannot be auto-detected (e.g. run via
+            ``python -m``) and no *section* argument is provided.
 
     Examples::
 
@@ -418,18 +457,20 @@ class ConfigManager:
         cfg = ConfigManager(logger=log)     # section="train" auto-detected
 
         cfg["input"]                        # → "data/clean.csv"
-        cfg["lr"]                           # → 0.01
+        cfg["lr"]                           # → 0.01  (float preserved, not "0.01")
         cfg.lr                              # → 0.01  (attribute-style shorthand)
         cfg["version"]                      # → "v2"  (from _globals)
         cfg.get("missing", "default")       # → "default"
     """
 
+    __hash__ = None  # type: ignore[assignment]
+
     def __init__(
         self,
-        section: Optional[str] = None,
+        section: str | None = None,
         *,
-        start_dir: Optional[str | Path] = None,
-        logger: Optional[logging.Logger] = None,
+        start_dir: str | Path | None = None,
+        logger: logging.Logger | None = None,
     ) -> None:
         self._log = logger
 
@@ -501,17 +542,8 @@ class ConfigManager:
     def __len__(self) -> int:
         return len(self._data)
 
-    def get(self, key: str, default: Any = None) -> Any:
+    def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
         return _wrap(self._data[key]) if key in self._data else default
-
-    def keys(self):
-        return self._data.keys()
-
-    def values(self):
-        return (_wrap(v) for v in self._data.values())
-
-    def items(self):
-        return ((k, _wrap(v)) for k, v in self._data.items())
 
     def to_dict(self) -> dict:
         """Return a plain dict, recursively converting any nested _Namespace objects."""
@@ -562,7 +594,7 @@ class ConfigManager:
         e.g. ``"01_preprocess"`` appears as ``_01_preprocess`` in completion.
         Keys with other invalid characters (hyphens etc.) are omitted.
         """
-        base: list[str] = super().__dir__()
+        base: list[str] = list(super().__dir__())
         config_keys = [a for k in self._data
                        if isinstance(k, str) and (a := _attr_name(k)) is not None]
         return base + config_keys

@@ -9,7 +9,6 @@ import pytest
 
 from refconf_manager import ConfigManager
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def write_config(directory: Path, data: dict, fmt: str = "json") -> Path:
@@ -613,7 +612,6 @@ class TestLogger:
         write_config(tmp_path, {"s": {"k": "v"}})
         log = logging.getLogger("test_cfg")
         messages: list[str] = []
-        handler = logging.handlers_list = []
 
         class Capture(logging.Handler):
             def emit(self, record):
@@ -644,3 +642,137 @@ class TestRepr:
         write_config(tmp_path, {"s": {}})
         cfg = ConfigManager(section="s", start_dir=tmp_path)
         assert "config.json" in repr(cfg)
+
+
+# ── Type preservation (sole {{ref}} values) ────────────────────────────────────
+
+class TestTypePreservation:
+    def test_float_reference_preserved(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"a": {"lr": 0.01}, "b": {"lr": "{{a.lr}}"}})
+        cfg = ConfigManager(section="b", start_dir=tmp_path)
+        assert cfg["lr"] == 0.01
+        assert isinstance(cfg["lr"], float)
+
+    def test_int_reference_preserved(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"a": {"epochs": 100}, "b": {"epochs": "{{a.epochs}}"}})
+        cfg = ConfigManager(section="b", start_dir=tmp_path)
+        assert cfg["epochs"] == 100
+        assert isinstance(cfg["epochs"], int)
+
+    def test_bool_reference_preserved(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"a": {"verbose": True}, "b": {"verbose": "{{a.verbose}}"}})
+        cfg = ConfigManager(section="b", start_dir=tmp_path)
+        assert cfg["verbose"] is True
+
+    def test_list_reference_preserved(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"a": {"tags": ["x", "y"]}, "b": {"tags": "{{a.tags}}"}})
+        cfg = ConfigManager(section="b", start_dir=tmp_path)
+        assert cfg["tags"] == ["x", "y"]
+        assert isinstance(cfg["tags"], list)
+
+    def test_embedded_ref_still_coerces_to_string(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"a": {"lr": 0.01}, "b": {"label": "lr={{a.lr}}"}})
+        cfg = ConfigManager(section="b", start_dir=tmp_path)
+        assert cfg["label"] == "lr=0.01"
+        assert isinstance(cfg["label"], str)
+
+    def test_globals_float_preserved(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"_globals": {"lr": 0.001}, "train": {"lr": "{{lr}}"}})
+        cfg = ConfigManager(section="train", start_dir=tmp_path)
+        assert cfg["lr"] == 0.001
+        assert isinstance(cfg["lr"], float)
+
+    def test_nested_dict_reference_preserved(self, tmp_path: Path) -> None:
+        # A sole {{ref}} to a dict preserves the dict value (wrapped as _Namespace,
+        # not coerced to the string "{'host': ...}").
+        write_config(tmp_path, {
+            "shared": {"db": {"host": "localhost", "port": 5432}},
+            "app": {"db": "{{shared.db}}"},
+        })
+        cfg = ConfigManager(section="app", start_dir=tmp_path)
+        assert cfg["db"] == {"host": "localhost", "port": 5432}
+        assert cfg["db"]["host"] == "localhost"  # accessible, not a flat string
+
+
+# ── Cross-section refs see globals-merged target ───────────────────────────────
+
+class TestCrossSectionGlobals:
+    def test_cross_section_ref_sees_globals(self, tmp_path: Path) -> None:
+        # {{B.key}} where key is only injected into B from _globals
+        write_config(tmp_path, {
+            "_globals": {"version": "v2"},
+            "a": {"ver": "{{b.version}}"},
+            "b": {"data": "mydata"},
+        })
+        cfg = ConfigManager(section="a", start_dir=tmp_path)
+        assert cfg["ver"] == "v2"
+
+    def test_cross_section_section_key_wins_over_globals(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {
+            "_globals": {"version": "v1"},
+            "a": {"ver": "{{b.version}}"},
+            "b": {"version": "v2-b"},
+        })
+        cfg = ConfigManager(section="a", start_dir=tmp_path)
+        assert cfg["ver"] == "v2-b"
+
+
+# ── .env export prefix ─────────────────────────────────────────────────────────
+
+class TestEnvExportSyntax:
+    def test_export_prefix_parsed(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv("EXPORT_VAR", raising=False)
+        write_config(tmp_path, {"s": {"v": "${EXPORT_VAR}"}})
+        write_env(tmp_path, "export EXPORT_VAR=hello\n")
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        assert cfg["v"] == "hello"
+
+    def test_export_prefix_not_overwritten(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("EXPORT_VAR", "original")
+        write_config(tmp_path, {"s": {"v": "${EXPORT_VAR}"}})
+        write_env(tmp_path, "export EXPORT_VAR=new\n")
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        assert cfg["v"] == "original"
+
+
+# ── Mapping ABC compliance ─────────────────────────────────────────────────────
+
+class TestMappingABC:
+    def test_config_manager_is_mapping(self, tmp_path: Path) -> None:
+        from collections.abc import Mapping
+        write_config(tmp_path, {"s": {"a": 1}})
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        assert isinstance(cfg, Mapping)
+
+    def test_namespace_is_mapping(self, tmp_path: Path) -> None:
+        from collections.abc import Mapping
+        write_config(tmp_path, {"s": {"nested": {"a": 1}}})
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        assert isinstance(cfg.nested, Mapping)
+
+    def test_values_supports_len(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"s": {"a": 1, "b": 2, "c": 3}})
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        assert len(cfg.values()) == 3
+
+    def test_items_supports_len(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"s": {"a": 1, "b": 2}})
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        assert len(cfg.items()) == 2
+
+    def test_namespace_values_supports_len(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"s": {"nested": {"a": 1, "b": 2}}})
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        assert len(cfg.nested.values()) == 2
+
+    def test_config_manager_not_hashable(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"s": {"a": 1}})
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        with pytest.raises(TypeError):
+            hash(cfg)
+
+    def test_namespace_not_hashable(self, tmp_path: Path) -> None:
+        write_config(tmp_path, {"s": {"nested": {"a": 1}}})
+        cfg = ConfigManager(section="s", start_dir=tmp_path)
+        with pytest.raises(TypeError):
+            hash(cfg.nested)
